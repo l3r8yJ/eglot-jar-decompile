@@ -53,5 +53,53 @@
         (list :jar (url-unhex-string jar)
               :entry (url-unhex-string entry))))))
 
+(defvar eglot-jar-decompile--buffer-kinds (make-hash-table :test #'equal))
+
+(defun eglot-jar-decompile--cache-path (jar entry operation decompiler-id)
+  "Return cache path for ENTRY of JAR for OPERATION and DECOMPILER-ID."
+  (let* ((attrs (file-attributes jar))
+         (key (secure-hash
+               'sha1
+               (format "%s\0%s\0%s\0%s\0%s\0%s"
+                       jar entry
+                       (file-attribute-size attrs)
+                       (file-attribute-modification-time attrs)
+                       operation decompiler-id))))
+    (expand-file-name (concat key "-" (file-name-nondirectory entry))
+                      eglot-jar-decompile-cache-directory)))
+
+(defun eglot-jar-decompile--extract-entry (jar entry target)
+  "Extract ENTRY from JAR into TARGET."
+  (let ((work (file-name-as-directory (make-temp-file "ejd-extract-" t))))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (let ((default-directory work))
+              (unless (zerop (call-process "jar" nil t nil
+                                           "--extract" "--file" jar entry))
+                (user-error "Cannot extract %s from %s" entry jar))))
+          (let ((produced (expand-file-name entry work)))
+            (unless (file-exists-p produced)
+              (user-error "Cannot extract %s from %s" entry jar))
+            (make-directory (file-name-directory target) t)
+            (rename-file produced target t)))
+      (delete-directory work t))))
+
+(defun eglot-jar-decompile--materialize (uri)
+  "Materialize URI as a local file.  Return (PATH . KIND) or nil."
+  (when-let* ((parts (eglot-jar-decompile--parse-uri uri)))
+    (let ((jar (plist-get parts :jar))
+          (entry (plist-get parts :entry)))
+      (unless (file-readable-p jar)
+        (user-error "Jar not found: %s" jar))
+      (unless (string-suffix-p ".class" entry)
+        (let ((target (eglot-jar-decompile--cache-path jar entry 'source "none")))
+          (unless (file-exists-p target)
+            (eglot-jar-decompile--extract-entry jar entry target))
+          (puthash (expand-file-name target) 'source
+                   eglot-jar-decompile--buffer-kinds)
+          (cons target 'source))))))
+
 (provide 'eglot-jar-decompile)
 ;;; eglot-jar-decompile.el ends here
