@@ -370,7 +370,8 @@
   (save-excursion
     (if (or (null line) (> line (line-number-at-pos (point-max))))
         (point-min)
-      (goto-line line)
+      (goto-char (point-min))
+      (forward-line (1- line))
       (line-beginning-position))))
 
 (defun eglot-jar-decompile--clamp-location (orig location &rest args)
