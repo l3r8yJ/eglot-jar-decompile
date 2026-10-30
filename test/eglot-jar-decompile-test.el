@@ -144,5 +144,15 @@
         (should (file-readable-p (lsp--uri-to-path uri))))
     (eglot-jar-decompile-mode -1)))
 
+(ert-deftest eglot-jar-decompile-test-clamp-existing-line ()
+  (with-temp-buffer
+    (insert "a\nb\nc\n")
+    (should (= (eglot-jar-decompile--clamp-position 2) 3))))
+
+(ert-deftest eglot-jar-decompile-test-clamp-missing-line ()
+  (with-temp-buffer
+    (insert "a\nb\nc\n")
+    (should (= (eglot-jar-decompile--clamp-position 40) (point-min)))))
+
 (provide 'eglot-jar-decompile-test)
 ;;; eglot-jar-decompile-test.el ends here

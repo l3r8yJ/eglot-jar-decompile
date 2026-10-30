@@ -292,6 +292,31 @@
     (advice-remove 'eglot-ensure #'eglot-jar-decompile--skip-in-cache))
   (setq eglot-jar-decompile--eglot-function nil))
 
+(defun eglot-jar-decompile--clamp-position (line)
+  "Return start of LINE, or `point-min' when LINE is out of range."
+  (save-excursion
+    (if (or (null line) (> line (line-number-at-pos (point-max))))
+        (point-min)
+      (goto-line line)
+      (line-beginning-position))))
+
+(defun eglot-jar-decompile--clamp-location (orig location &rest args)
+  "Call ORIG with LOCATION and ARGS, then clamp point in decompiled buffers."
+  (apply orig location args)
+  (when (eq eglot-jar-decompile--kind 'decompiled)
+    (when-let* ((line (ignore-errors (xref-file-location-line location))))
+      (goto-char (eglot-jar-decompile--clamp-position line)))))
+
+(defun eglot-jar-decompile--install-xref ()
+  (when (fboundp 'xref--goto-location)
+    (advice-add 'xref--goto-location :around
+                #'eglot-jar-decompile--clamp-location)))
+
+(defun eglot-jar-decompile--uninstall-xref ()
+  (when (fboundp 'xref--goto-location)
+    (advice-remove 'xref--goto-location
+                   #'eglot-jar-decompile--clamp-location)))
+
 (defun eglot-jar-decompile--lsp-uri-to-path (orig uri)
   "Resolve ORIG's result for URI when it is still a jar URI."
   (let ((result (funcall orig uri)))
@@ -322,9 +347,11 @@
         (with-eval-after-load 'lsp-mode (eglot-jar-decompile--install-lsp))
         (when (featurep 'lsp-mode)
           (eglot-jar-decompile--install-lsp))
+        (eglot-jar-decompile--install-xref)
         (add-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode))
     (eglot-jar-decompile--uninstall-eglot)
     (eglot-jar-decompile--uninstall-lsp)
+    (eglot-jar-decompile--uninstall-xref)
     (remove-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode)))
 
 (provide 'eglot-jar-decompile)
