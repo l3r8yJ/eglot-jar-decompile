@@ -74,9 +74,9 @@ Cache lives in `$XDG_CACHE_HOME/eglot-jar-decompile/`, falling back to `~/.cache
 ## Development
 
 ```sh
-make compile
-make test
-make lint
+just compile
+just test
+just lint
 ```
 
 Tests build fixture jars with the JDK `jar` tool at runtime; the decompiler tests use `javac` and `javap`.
