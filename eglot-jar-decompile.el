@@ -241,6 +241,8 @@
                    eglot-jar-decompile--buffer-kinds)
           (cons target 'source))))))
 
+(defvar eglot-jar-decompile-mode)
+
 (defvar-local eglot-jar-decompile--kind nil)
 
 (defvar eglot-jar-decompile--eglot-function nil)
@@ -290,6 +292,25 @@
     (advice-remove 'eglot-ensure #'eglot-jar-decompile--skip-in-cache))
   (setq eglot-jar-decompile--eglot-function nil))
 
+(defun eglot-jar-decompile--lsp-uri-to-path (orig uri)
+  "Resolve ORIG's result for URI when it is still a jar URI."
+  (let ((result (funcall orig uri)))
+    (if (and (stringp result) (string-prefix-p "jar:" result))
+        (car (eglot-jar-decompile--materialize result))
+      result)))
+
+(defun eglot-jar-decompile--install-lsp ()
+  (when eglot-jar-decompile-mode
+    (advice-add 'lsp--uri-to-path :around #'eglot-jar-decompile--lsp-uri-to-path)
+    (advice-add 'lsp :around #'eglot-jar-decompile--skip-in-cache)
+    (advice-add 'lsp-deferred :around #'eglot-jar-decompile--skip-in-cache)))
+
+(defun eglot-jar-decompile--uninstall-lsp ()
+  (when (featurep 'lsp-mode)
+    (advice-remove 'lsp--uri-to-path #'eglot-jar-decompile--lsp-uri-to-path)
+    (advice-remove 'lsp #'eglot-jar-decompile--skip-in-cache)
+    (advice-remove 'lsp-deferred #'eglot-jar-decompile--skip-in-cache)))
+
 ;;;###autoload
 (define-minor-mode eglot-jar-decompile-mode
   "Resolve jar: URIs from Eglot and lsp-mode."
@@ -298,8 +319,12 @@
   (if eglot-jar-decompile-mode
       (progn
         (eglot-jar-decompile--install-eglot)
+        (with-eval-after-load 'lsp-mode (eglot-jar-decompile--install-lsp))
+        (when (featurep 'lsp-mode)
+          (eglot-jar-decompile--install-lsp))
         (add-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode))
     (eglot-jar-decompile--uninstall-eglot)
+    (eglot-jar-decompile--uninstall-lsp)
     (remove-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode)))
 
 (provide 'eglot-jar-decompile)

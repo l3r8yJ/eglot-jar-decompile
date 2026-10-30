@@ -134,5 +134,15 @@
           (kill-buffer buffer)))
     (eglot-jar-decompile-mode -1)))
 
+(ert-deftest eglot-jar-decompile-test-lsp-advice ()
+  (skip-unless (require 'lsp-mode nil t))
+  (eglot-jar-decompile-mode 1)
+  (unwind-protect
+      (let* ((eglot-jar-decompile-cache-directory (make-temp-file "ejd-cache-" t))
+             (fixture (eglot-jar-decompile-test--fixture-jar))
+             (uri (format "jar://%s!/a/b/C.java" (car fixture))))
+        (should (file-readable-p (lsp--uri-to-path uri))))
+    (eglot-jar-decompile-mode -1)))
+
 (provide 'eglot-jar-decompile-test)
 ;;; eglot-jar-decompile-test.el ends here
