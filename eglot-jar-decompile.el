@@ -66,7 +66,8 @@
         (list :jar (url-unhex-string jar)
               :entry (url-unhex-string entry))))))
 
-(defvar eglot-jar-decompile--buffer-kinds (make-hash-table :test #'equal))
+(defvar eglot-jar-decompile--buffer-kinds (make-hash-table :test #'equal)
+  "Map of cache file path to `source' or `decompiled'.")
 
 (defun eglot-jar-decompile--cache-path (jar entry operation decompiler-id)
   "Return cache path for ENTRY of JAR for OPERATION and DECOMPILER-ID."
@@ -120,7 +121,7 @@
        (if-let* ((found (and eglot-jar-decompile-javap-fallback
                              (executable-find "javap"))))
            (list :type 'javap :program found)
-         (user-error "javap not found; install a JDK")))
+         (user-error "No javap found; install a JDK")))
       ('fernflower
        (let ((jar (or (and program (string-suffix-p ".jar" program) program)
                       (eglot-jar-decompile--fernflower-jar))))
@@ -132,7 +133,7 @@
                         (executable-find (symbol-name requested)))))
          (if found
              (list :type requested :program found)
-           (user-error "%s not found; install it or set `eglot-jar-decompile-decompiler-program'"
+           (user-error "No %s found; install it or set `eglot-jar-decompile-decompiler-program'"
                        (symbol-name requested)))))
       ('auto
        (cond
@@ -241,11 +242,14 @@
                    eglot-jar-decompile--buffer-kinds)
           (cons target 'source))))))
 
-(defvar eglot-jar-decompile-mode)
+(defvar eglot-jar-decompile-mode
+  "Non-nil when `eglot-jar-decompile-mode' is enabled.")
 
-(defvar-local eglot-jar-decompile--kind nil)
+(defvar-local eglot-jar-decompile--kind nil
+  "What the current cache buffer holds: `source' or `decompiled'.")
 
-(defvar eglot-jar-decompile--eglot-function nil)
+(defvar eglot-jar-decompile--eglot-function nil
+  "Eglot URI conversion function currently advised.")
 
 (defun eglot-jar-decompile--cache-buffer-p ()
   "Return non-nil when the current buffer visits a cache file."
@@ -276,6 +280,7 @@
     (funcall orig uri)))
 
 (defun eglot-jar-decompile--install-eglot ()
+  "Install Eglot advice."
   (require 'eglot)
   (setq eglot-jar-decompile--eglot-function
         (if (fboundp 'eglot-uri-to-path) 'eglot-uri-to-path 'eglot--uri-to-path))
@@ -284,6 +289,7 @@
   (advice-add 'eglot-ensure :around #'eglot-jar-decompile--skip-in-cache))
 
 (defun eglot-jar-decompile--uninstall-eglot ()
+  "Remove Eglot advice."
   (when (and eglot-jar-decompile--eglot-function
              (fboundp eglot-jar-decompile--eglot-function))
     (advice-remove eglot-jar-decompile--eglot-function
@@ -308,11 +314,13 @@
       (goto-char (eglot-jar-decompile--clamp-position line)))))
 
 (defun eglot-jar-decompile--install-xref ()
+  "Install xref point-clamping advice."
   (when (fboundp 'xref--goto-location)
     (advice-add 'xref--goto-location :around
                 #'eglot-jar-decompile--clamp-location)))
 
 (defun eglot-jar-decompile--uninstall-xref ()
+  "Remove xref point-clamping advice."
   (when (fboundp 'xref--goto-location)
     (advice-remove 'xref--goto-location
                    #'eglot-jar-decompile--clamp-location)))
@@ -325,12 +333,19 @@
       result)))
 
 (defun eglot-jar-decompile--install-lsp ()
-  (when eglot-jar-decompile-mode
-    (advice-add 'lsp--uri-to-path :around #'eglot-jar-decompile--lsp-uri-to-path)
-    (advice-add 'lsp :around #'eglot-jar-decompile--skip-in-cache)
-    (advice-add 'lsp-deferred :around #'eglot-jar-decompile--skip-in-cache)))
+  "Install lsp-mode advice."
+  (when (and eglot-jar-decompile-mode (featurep 'lsp-mode))
+    (unless (advice-member-p #'eglot-jar-decompile--lsp-uri-to-path
+                             'lsp--uri-to-path)
+      (advice-add 'lsp--uri-to-path :around
+                  #'eglot-jar-decompile--lsp-uri-to-path))
+    (unless (advice-member-p #'eglot-jar-decompile--skip-in-cache 'lsp)
+      (advice-add 'lsp :around #'eglot-jar-decompile--skip-in-cache))
+    (unless (advice-member-p #'eglot-jar-decompile--skip-in-cache 'lsp-deferred)
+      (advice-add 'lsp-deferred :around #'eglot-jar-decompile--skip-in-cache))))
 
 (defun eglot-jar-decompile--uninstall-lsp ()
+  "Remove lsp-mode advice."
   (when (featurep 'lsp-mode)
     (advice-remove 'lsp--uri-to-path #'eglot-jar-decompile--lsp-uri-to-path)
     (advice-remove 'lsp #'eglot-jar-decompile--skip-in-cache)
@@ -344,12 +359,13 @@
   (if eglot-jar-decompile-mode
       (progn
         (eglot-jar-decompile--install-eglot)
-        (with-eval-after-load 'lsp-mode (eglot-jar-decompile--install-lsp))
+        (add-hook 'lsp-mode-hook #'eglot-jar-decompile--install-lsp)
         (when (featurep 'lsp-mode)
           (eglot-jar-decompile--install-lsp))
         (eglot-jar-decompile--install-xref)
         (add-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode))
     (eglot-jar-decompile--uninstall-eglot)
+    (remove-hook 'lsp-mode-hook #'eglot-jar-decompile--install-lsp)
     (eglot-jar-decompile--uninstall-lsp)
     (eglot-jar-decompile--uninstall-xref)
     (remove-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode)))

@@ -1,4 +1,5 @@
 *.elc
+.elpa/
 .superpowers/
 test/fixtures/*.jar
 test/fixtures/classes/

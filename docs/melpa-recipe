@@ -1,0 +1,3 @@
+(eglot-jar-decompile
+ :fetcher github
+ :repo "l3r8yJ/eglot-jar-decompile")
