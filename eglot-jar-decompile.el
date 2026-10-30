@@ -14,6 +14,8 @@
 
 ;;; Code:
 
+(require 'seq)
+(require 'subr-x)
 (require 'xref)
 (require 'url-parse)
 
@@ -28,6 +30,22 @@
    (or (getenv "XDG_CACHE_HOME") "~/.cache"))
   "Directory for extracted and decompiled files."
   :type 'directory)
+
+(defcustom eglot-jar-decompile-decompiler 'auto
+  "Decompiler to use, or `auto' to detect one."
+  :type '(choice (const :tag "Auto-detect" auto)
+                 (const :tag "CFR" cfr)
+                 (const :tag "JD-cli" jd-cli)
+                 (const :tag "Fernflower" fernflower)
+                 (const :tag "javap disassembly" javap)))
+
+(defcustom eglot-jar-decompile-decompiler-program nil
+  "Path to the decompiler executable or Fernflower jar."
+  :type '(choice (const :tag "Unset" nil) string))
+
+(defcustom eglot-jar-decompile-javap-fallback t
+  "Whether javap disassembly may stand in for a real decompiler."
+  :type 'boolean)
 
 (define-minor-mode eglot-jar-decompile-mode
   "Resolve jar: URIs from Eglot and lsp-mode."
@@ -86,6 +104,132 @@
             (rename-file produced target t)))
       (delete-directory work t))))
 
+(defun eglot-jar-decompile--fernflower-jar ()
+  "Return a readable Fernflower jar path, or nil."
+  (seq-find
+   #'file-readable-p
+   (append
+    (file-expand-wildcards
+     "~/.local/share/JetBrains/Toolbox/apps/*/plugins/java-decompiler/lib/java-decompiler.jar")
+    (file-expand-wildcards
+     "/opt/*/plugins/java-decompiler/lib/java-decompiler.jar")
+    (list "/usr/share/java/fernflower.jar"
+          "/usr/share/java/java-decompiler.jar"))))
+
+(defun eglot-jar-decompile--detect-decompiler ()
+  "Return a (:type TYPE :program PROGRAM) plist for the chosen decompiler."
+  (let ((requested eglot-jar-decompile-decompiler)
+        (program eglot-jar-decompile-decompiler-program))
+    (pcase requested
+      ('javap
+       (if-let* ((found (and eglot-jar-decompile-javap-fallback
+                             (executable-find "javap"))))
+           (list :type 'javap :program found)
+         (user-error "javap not found; install a JDK")))
+      ('fernflower
+       (let ((jar (or (and program (string-suffix-p ".jar" program) program)
+                      (eglot-jar-decompile--fernflower-jar))))
+         (if (and jar (file-readable-p jar))
+             (list :type 'fernflower :program jar)
+           (user-error "Fernflower jar not found; set `eglot-jar-decompile-decompiler-program'"))))
+      ((or 'cfr 'jd-cli)
+       (let ((found (or (and program (file-executable-p program) program)
+                        (executable-find (symbol-name requested)))))
+         (if found
+             (list :type requested :program found)
+           (user-error "%s not found; install it or set `eglot-jar-decompile-decompiler-program'"
+                       (symbol-name requested)))))
+      ('auto
+       (cond
+        ((and program (file-executable-p program))
+         (list :type (if (string-suffix-p ".jar" program) 'fernflower 'cfr)
+               :program program))
+        ((executable-find "cfr")
+         (list :type 'cfr :program (executable-find "cfr")))
+        ((executable-find "jd-cli")
+         (list :type 'jd-cli :program (executable-find "jd-cli")))
+        ((eglot-jar-decompile--fernflower-jar)
+         (list :type 'fernflower :program (eglot-jar-decompile--fernflower-jar)))
+        ((and eglot-jar-decompile-javap-fallback (executable-find "javap"))
+         (list :type 'javap :program (executable-find "javap")))
+        (t
+         (user-error "No Java decompiler found; install CFR, JD-cli, Fernflower, or a JDK"))))
+      (_
+       (user-error "Unknown `eglot-jar-decompile-decompiler': %s" requested)))))
+
+(defun eglot-jar-decompile--decompiler-id (decompiler)
+  "Return a stable identity string for DECOMPILER."
+  (let ((type (plist-get decompiler :type))
+        (program (plist-get decompiler :program)))
+    (if (eq type 'fernflower)
+        (let ((attrs (file-attributes program)))
+          (format "fernflower:%s:%s:%s" program
+                  (or (file-attribute-size attrs) 0)
+                  (or (file-attribute-modification-time attrs) 0)))
+      (format "%s:%s" type program))))
+
+(defun eglot-jar-decompile--class-name (entry)
+  "Turn jar ENTRY into a Java class name."
+  (string-remove-suffix ".class" (replace-regexp-in-string "/" "." entry)))
+
+(defun eglot-jar-decompile--javap (jar entry target)
+  "Write javap disassembly of ENTRY in JAR to TARGET."
+  (with-temp-buffer
+    (unless (zerop (call-process "javap" nil t nil "-p" "-c" "-cp" jar
+                                 (eglot-jar-decompile--class-name entry)))
+      (user-error "Cannot disassemble %s from %s" entry jar))
+    (write-region (point-min) (point-max) target nil 'quiet)))
+
+(defun eglot-jar-decompile--run-decompiler (decompiler class out)
+  "Run DECOMPILER on CLASS writing sources under OUT."
+  (pcase (plist-get decompiler :type)
+    ('cfr
+     (let ((program (plist-get decompiler :program)))
+       (if (string-suffix-p ".jar" program)
+           (call-process "java" nil nil nil "-jar" program class "--outputdir" out)
+         (call-process program nil nil nil class "--outputdir" out))))
+    ('jd-cli
+     (call-process (plist-get decompiler :program) nil nil nil class "-od" out))
+    ('fernflower
+     (call-process "java" nil nil nil "-cp" (plist-get decompiler :program)
+                   "org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler"
+                   class out))))
+
+(defun eglot-jar-decompile--decompile-entry (jar entry target decompiler)
+  "Decompile ENTRY from JAR into TARGET using DECOMPILER."
+  (let* ((work (file-name-as-directory (make-temp-file "ejd-decompile-" t)))
+         (class (expand-file-name "input.class" work))
+         (out (expand-file-name "out/" work)))
+    (make-directory out t)
+    (unwind-protect
+        (progn
+          (eglot-jar-decompile--extract-entry jar entry class)
+          (make-directory (file-name-directory target) t)
+          (if (eq (plist-get decompiler :type) 'javap)
+              (eglot-jar-decompile--javap jar entry target)
+            (eglot-jar-decompile--run-decompiler decompiler class out)
+            (let ((produced (car (directory-files-recursively out "\\.java\\'"))))
+              (cond
+               (produced
+                (copy-file produced target t))
+               ((and eglot-jar-decompile-javap-fallback (executable-find "javap"))
+                (eglot-jar-decompile--javap jar entry target))
+               (t
+                (user-error "Cannot decompile %s from %s" entry jar))))))
+      (delete-directory work t))))
+
+(defun eglot-jar-decompile--materialize-class (jar entry)
+  "Materialize class ENTRY from JAR, decompiling it."
+  (let* ((decompiler (eglot-jar-decompile--detect-decompiler))
+         (target (eglot-jar-decompile--cache-path
+                  jar entry 'decompiled
+                  (eglot-jar-decompile--decompiler-id decompiler))))
+    (unless (file-exists-p target)
+      (eglot-jar-decompile--decompile-entry jar entry target decompiler))
+    (puthash (expand-file-name target) 'decompiled
+             eglot-jar-decompile--buffer-kinds)
+    (cons target 'decompiled)))
+
 (defun eglot-jar-decompile--materialize (uri)
   "Materialize URI as a local file.  Return (PATH . KIND) or nil."
   (when-let* ((parts (eglot-jar-decompile--parse-uri uri)))
@@ -93,7 +237,8 @@
           (entry (plist-get parts :entry)))
       (unless (file-readable-p jar)
         (user-error "Jar not found: %s" jar))
-      (unless (string-suffix-p ".class" entry)
+      (if (string-suffix-p ".class" entry)
+          (eglot-jar-decompile--materialize-class jar entry)
         (let ((target (eglot-jar-decompile--cache-path jar entry 'source "none")))
           (unless (file-exists-p target)
             (eglot-jar-decompile--extract-entry jar entry target))

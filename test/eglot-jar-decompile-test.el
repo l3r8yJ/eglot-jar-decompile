@@ -66,5 +66,37 @@
     (should (equal (directory-files eglot-jar-decompile-cache-directory nil "\\`[^.]")
                    nil))))
 
+(ert-deftest eglot-jar-decompile-test-no-decompiler-errors ()
+  (let ((eglot-jar-decompile-decompiler 'cfr)
+        (eglot-jar-decompile-decompiler-program nil)
+        (exec-path nil))
+    (should-error (eglot-jar-decompile--detect-decompiler) :type 'user-error)))
+
+(ert-deftest eglot-jar-decompile-test-javap-fallback ()
+  (let ((eglot-jar-decompile-decompiler 'javap)
+        (eglot-jar-decompile-decompiler-program (executable-find "javap")))
+    (should (eq (plist-get (eglot-jar-decompile--detect-decompiler) :type)
+                'javap))))
+
+(ert-deftest eglot-jar-decompile-test-decompiles-class ()
+  (skip-unless (executable-find "javac"))
+  (let* ((eglot-jar-decompile-cache-directory (make-temp-file "ejd-cache-" t))
+         (root (make-temp-file "ejd-class-" t))
+         (src (expand-file-name "a/b/C.java" root))
+         (classes (expand-file-name "classes" root))
+         (jar (expand-file-name "classes.jar" root)))
+    (make-directory (file-name-directory src) t)
+    (with-temp-file src (insert "package a.b; public class C { int x() { return 1; } }\n"))
+    (call-process "javac" nil nil nil "-d" classes src)
+    (call-process "jar" nil nil nil "--create" "--file" jar "-C" classes ".")
+    (let* ((eglot-jar-decompile-decompiler 'javap)
+           (result (eglot-jar-decompile--materialize
+                    (format "jar://%s!/a/b/C.class" jar))))
+      (should (eq (cdr result) 'decompiled))
+      (should (with-temp-buffer
+                (insert-file-contents (car result))
+                (goto-char (point-min))
+                (search-forward "class a.b.C" nil t))))))
+
 (provide 'eglot-jar-decompile-test)
 ;;; eglot-jar-decompile-test.el ends here
