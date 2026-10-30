@@ -47,6 +47,14 @@
   "Whether javap disassembly may stand in for a real decompiler."
   :type 'boolean)
 
+(defun eglot-jar-decompile--unsafe-entry-p (entry)
+  "Return non-nil when ENTRY could escape the extraction directory."
+  (or (string-empty-p entry)
+      (string-prefix-p "/" entry)
+      (string-match-p "\\`[A-Za-z]:" entry)
+      (seq-some (lambda (part) (member part '("." "..")))
+                (split-string entry "/"))))
+
 (defun eglot-jar-decompile--parse-uri (uri)
   "Parse URI into a (:jar PATH :entry ENTRY) plist, or nil when not a jar URI."
   (when (and (stringp uri) (string-prefix-p "jar:" uri))
@@ -59,12 +67,15 @@
         (user-error "Malformed jar URI: %s" uri))
       (let ((jar (substring body 0 sep))
             (entry (substring body (+ sep 2))))
-        (when (string-search "!/" entry)
-          (user-error "Nested jar archives are not supported: %s" uri))
         (when (string-prefix-p "//" jar)
           (setq jar (substring jar 2)))
-        (list :jar (url-unhex-string jar)
-              :entry (url-unhex-string entry))))))
+        (setq jar (url-unhex-string jar)
+              entry (url-unhex-string entry))
+        (when (string-search "!/" entry)
+          (user-error "Nested jar archives are not supported: %s" uri))
+        (when (eglot-jar-decompile--unsafe-entry-p entry)
+          (user-error "Unsafe jar entry: %s" entry))
+        (list :jar jar :entry entry)))))
 
 (defvar eglot-jar-decompile--buffer-kinds (make-hash-table :test #'equal)
   "Map of cache file path to `source' or `decompiled'.")
@@ -79,35 +90,74 @@
                        (file-attribute-size attrs)
                        (file-attribute-modification-time attrs)
                        operation decompiler-id))))
-    (expand-file-name (concat key "-" (file-name-nondirectory entry))
+    (expand-file-name (concat key "-"
+                              (if (eq operation 'decompiled)
+                                  (concat (file-name-base entry) ".java")
+                                (file-name-nondirectory entry)))
                       eglot-jar-decompile-cache-directory)))
+
+(defun eglot-jar-decompile--atomic-write (target writer)
+  "Create TARGET by calling WRITER with a temporary file path."
+  (make-directory (file-name-directory target) t)
+  (let ((temp (make-temp-file
+               (expand-file-name ".ejd-" (file-name-directory target)))))
+    (unwind-protect
+        (progn
+          (funcall writer temp)
+          (rename-file temp target t))
+      (when (file-exists-p temp)
+        (delete-file temp)))))
+
+(defun eglot-jar-decompile--atomic-copy (source target)
+  "Copy SOURCE to TARGET atomically."
+  (eglot-jar-decompile--atomic-write
+   target (lambda (temp) (copy-file source temp t))))
 
 (defun eglot-jar-decompile--extract-entry (jar entry target)
   "Extract ENTRY from JAR into TARGET."
-  (let ((work (file-name-as-directory (make-temp-file "ejd-extract-" t))))
-    (unwind-protect
-        (progn
-          (with-temp-buffer
-            (set-buffer-multibyte nil)
-            (let ((default-directory work))
-              (unless (zerop (call-process "jar" nil t nil
-                                           "--extract" "--file" jar entry))
-                (user-error "Cannot extract %s from %s" entry jar))))
-          (let ((produced (expand-file-name entry work)))
-            (unless (file-exists-p produced)
-              (user-error "Cannot extract %s from %s" entry jar))
-            (make-directory (file-name-directory target) t)
-            (rename-file produced target t)))
-      (delete-directory work t))))
+  (cond
+   ((executable-find "jar")
+    (let ((work (file-name-as-directory (make-temp-file "ejd-extract-" t))))
+      (unwind-protect
+          (progn
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (let ((default-directory work))
+                (unless (zerop (call-process "jar" nil t nil
+                                             "--extract" "--file" jar entry))
+                  (user-error "Cannot extract %s from %s" entry jar))))
+            (let ((produced (expand-file-name entry work)))
+              (unless (and (file-regular-p produced)
+                           (file-in-directory-p produced work))
+                (user-error "Cannot extract %s from %s" entry jar))
+              (eglot-jar-decompile--atomic-copy produced target)))
+        (delete-directory work t))))
+   ((executable-find "unzip")
+    (eglot-jar-decompile--atomic-write
+     target
+     (lambda (temp)
+       (with-temp-buffer
+         (set-buffer-multibyte nil)
+         (unless (zerop (call-process "unzip" nil t nil "-p" jar entry))
+           (user-error "Cannot extract %s from %s" entry jar))
+         (write-region (point-min) (point-max) temp nil 'quiet)))))
+   (t
+    (user-error "Neither jar nor unzip found; install a JDK or unzip"))))
+
+(defun eglot-jar-decompile--wildcards (pattern)
+  "Expand PATTERN, treating unreadable directories as no match."
+  (condition-case nil
+      (file-expand-wildcards pattern)
+    (error nil)))
 
 (defun eglot-jar-decompile--fernflower-jar ()
   "Return a readable Fernflower jar path, or nil."
   (seq-find
    #'file-readable-p
    (append
-    (file-expand-wildcards
+    (eglot-jar-decompile--wildcards
      "~/.local/share/JetBrains/Toolbox/apps/*/plugins/java-decompiler/lib/java-decompiler.jar")
-    (file-expand-wildcards
+    (eglot-jar-decompile--wildcards
      "/opt/*/plugins/java-decompiler/lib/java-decompiler.jar")
     (list "/usr/share/java/fernflower.jar"
           "/usr/share/java/java-decompiler.jar"))))
@@ -170,11 +220,14 @@
 
 (defun eglot-jar-decompile--javap (jar entry target)
   "Write javap disassembly of ENTRY in JAR to TARGET."
-  (with-temp-buffer
-    (unless (zerop (call-process "javap" nil t nil "-p" "-c" "-cp" jar
-                                 (eglot-jar-decompile--class-name entry)))
-      (user-error "Cannot disassemble %s from %s" entry jar))
-    (write-region (point-min) (point-max) target nil 'quiet)))
+  (eglot-jar-decompile--atomic-write
+   target
+   (lambda (temp)
+     (with-temp-buffer
+       (unless (zerop (call-process "javap" nil t nil "-p" "-c" "-cp" jar
+                                    (eglot-jar-decompile--class-name entry)))
+         (user-error "Cannot disassemble %s from %s" entry jar))
+       (write-region (point-min) (point-max) temp nil 'quiet)))))
 
 (defun eglot-jar-decompile--run-decompiler (decompiler class out)
   "Run DECOMPILER on CLASS writing sources under OUT."
@@ -196,23 +249,34 @@
   (let* ((work (file-name-as-directory (make-temp-file "ejd-decompile-" t)))
          (class (expand-file-name "input.class" work))
          (out (expand-file-name "out/" work)))
-    (make-directory out t)
     (unwind-protect
         (progn
+          (make-directory out t)
           (eglot-jar-decompile--extract-entry jar entry class)
-          (make-directory (file-name-directory target) t)
           (if (eq (plist-get decompiler :type) 'javap)
               (eglot-jar-decompile--javap jar entry target)
             (eglot-jar-decompile--run-decompiler decompiler class out)
             (let ((produced (car (directory-files-recursively out "\\.java\\'"))))
               (cond
                (produced
-                (copy-file produced target t))
+                (eglot-jar-decompile--atomic-copy produced target))
                ((and eglot-jar-decompile-javap-fallback (executable-find "javap"))
                 (eglot-jar-decompile--javap jar entry target))
                (t
                 (user-error "Cannot decompile %s from %s" entry jar))))))
       (delete-directory work t))))
+
+(defun eglot-jar-decompile--cached (target create)
+  "Ensure TARGET exists by calling CREATE; delete a partial TARGET on failure."
+  (unless (file-exists-p target)
+    (make-directory (file-name-directory target) t)
+    (condition-case err
+        (funcall create)
+      (error
+       (when (file-exists-p target)
+         (ignore-errors (delete-file target)))
+       (signal (car err) (cdr err)))))
+  target)
 
 (defun eglot-jar-decompile--materialize-class (jar entry)
   "Materialize class ENTRY from JAR, decompiling it."
@@ -220,8 +284,10 @@
          (target (eglot-jar-decompile--cache-path
                   jar entry 'decompiled
                   (eglot-jar-decompile--decompiler-id decompiler))))
-    (unless (file-exists-p target)
-      (eglot-jar-decompile--decompile-entry jar entry target decompiler))
+    (eglot-jar-decompile--cached
+     target
+     (lambda ()
+       (eglot-jar-decompile--decompile-entry jar entry target decompiler)))
     (puthash (expand-file-name target) 'decompiled
              eglot-jar-decompile--buffer-kinds)
     (cons target 'decompiled)))
@@ -236,8 +302,9 @@
       (if (string-suffix-p ".class" entry)
           (eglot-jar-decompile--materialize-class jar entry)
         (let ((target (eglot-jar-decompile--cache-path jar entry 'source "none")))
-          (unless (file-exists-p target)
-            (eglot-jar-decompile--extract-entry jar entry target))
+          (eglot-jar-decompile--cached
+           target
+           (lambda () (eglot-jar-decompile--extract-entry jar entry target)))
           (puthash (expand-file-name target) 'source
                    eglot-jar-decompile--buffer-kinds)
           (cons target 'source))))))

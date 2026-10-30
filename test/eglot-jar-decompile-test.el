@@ -1,5 +1,6 @@
 ;;; eglot-jar-decompile-test.el --- Tests -*- lexical-binding: t; -*-
 
+(require 'cl-lib)
 (require 'ert)
 (require 'eglot-jar-decompile)
 
@@ -115,7 +116,7 @@
       (let* ((eglot-jar-decompile-cache-directory (make-temp-file "ejd-cache-" t))
              (fixture (eglot-jar-decompile-test--fixture-jar))
              (uri (format "jar://%s!/a/b/C.java" (car fixture)))
-             (path (eglot-uri-to-path uri)))
+             (path (funcall (eglot-jar-decompile-test--eglot-path-function) uri)))
         (should (file-readable-p path)))
     (eglot-jar-decompile-mode -1)))
 
@@ -153,6 +154,89 @@
   (with-temp-buffer
     (insert "a\nb\nc\n")
     (should (= (eglot-jar-decompile--clamp-position 40) (point-min)))))
+
+(ert-deftest eglot-jar-decompile-test-rejects-unsafe-entries ()
+  (dolist (entry '("" "../victim.txt" "/tmp/victim.txt" "." "./" "dir/../../x"
+                   "%2e%2e%2fvictim" "b.jar%21%2Fc.class"))
+    (should-error (eglot-jar-decompile--parse-uri
+                   (format "jar:///tmp/lib.jar!/%s" entry))
+                  :type 'user-error)))
+
+(ert-deftest eglot-jar-decompile-test-traversal-leaves-victim ()
+  (let* ((fixture (eglot-jar-decompile-test--fixture-jar))
+         (root (cdr fixture))
+         (victim (expand-file-name "victim.txt" root)))
+    (with-temp-file victim (insert "keep"))
+    (should-error
+     (eglot-jar-decompile--materialize
+      (format "jar://%s!//%s" (car fixture) (substring victim 1)))
+     :type 'user-error)
+    (should (equal (with-temp-buffer
+                     (insert-file-contents victim)
+                     (buffer-string))
+                   "keep"))))
+
+(ert-deftest eglot-jar-decompile-test-detection-survives-unreadable-dirs ()
+  (let ((eglot-jar-decompile-decompiler 'auto)
+        (eglot-jar-decompile-decompiler-program nil)
+        (eglot-jar-decompile-javap-fallback t)
+        (exec-path (list (file-name-directory (executable-find "javap")))))
+    (cl-letf (((symbol-function 'file-expand-wildcards)
+               (lambda (&rest _) (error "Permission denied"))))
+      (should (eq (plist-get (eglot-jar-decompile--detect-decompiler) :type)
+                  'javap)))))
+
+(ert-deftest eglot-jar-decompile-test-decompiled-cache-is-java ()
+  (skip-unless (executable-find "javac"))
+  (let* ((eglot-jar-decompile-cache-directory (make-temp-file "ejd-cache-" t))
+         (root (make-temp-file "ejd-class-" t))
+         (src (expand-file-name "a/b/C.java" root))
+         (classes (expand-file-name "classes" root))
+         (jar (expand-file-name "classes.jar" root)))
+    (make-directory (file-name-directory src) t)
+    (with-temp-file src (insert "package a.b; public class C {}\n"))
+    (call-process "javac" nil nil nil "-d" classes src)
+    (call-process "jar" nil nil nil "--create" "--file" jar "-C" classes ".")
+    (let* ((eglot-jar-decompile-decompiler 'javap)
+           (result (eglot-jar-decompile--materialize
+                    (format "jar://%s!/a/b/C.class" jar)))
+           (buffer (find-file-noselect (car result))))
+      (unwind-protect
+          (progn
+            (should (equal (file-name-extension (car result)) "java"))
+            (with-current-buffer buffer
+              (should (derived-mode-p 'java-mode))))
+        (kill-buffer buffer)))))
+
+(ert-deftest eglot-jar-decompile-test-partial-target-cleaned ()
+  (skip-unless (executable-find "javac"))
+  (let* ((eglot-jar-decompile-cache-directory (make-temp-file "ejd-cache-" t))
+         (root (make-temp-file "ejd-class-" t))
+         (src (expand-file-name "a/b/C.java" root))
+         (classes (expand-file-name "classes" root))
+         (jar (expand-file-name "classes.jar" root))
+         (target nil))
+    (make-directory (file-name-directory src) t)
+    (with-temp-file src (insert "package a.b; public class C {}\n"))
+    (call-process "javac" nil nil nil "-d" classes src)
+    (call-process "jar" nil nil nil "--create" "--file" jar "-C" classes ".")
+    (cl-letf (((symbol-function 'eglot-jar-decompile--decompile-entry)
+               (lambda (_jar _entry target-path _decompiler)
+                 (setq target target-path)
+                 (write-region "partial" nil target-path nil 'quiet)
+                 (error "boom"))))
+      (should-error
+       (eglot-jar-decompile--materialize
+        (format "jar://%s!/a/b/C.class" jar))))
+    (should-not (and target (file-exists-p target)))))
+
+(ert-deftest eglot-jar-decompile-test-extraction-requires-tools ()
+  (let ((fixture (eglot-jar-decompile-test--fixture-jar)))
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+      (should-error
+       (eglot-jar-decompile--materialize
+        (format "jar://%s!/a/b/C.java" (car fixture)))
+       :type 'user-error))))
 
 (provide 'eglot-jar-decompile-test)
 ;;; eglot-jar-decompile-test.el ends here
