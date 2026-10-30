@@ -47,11 +47,6 @@
   "Whether javap disassembly may stand in for a real decompiler."
   :type 'boolean)
 
-(define-minor-mode eglot-jar-decompile-mode
-  "Resolve jar: URIs from Eglot and lsp-mode."
-  :global t
-  :group 'eglot-jar-decompile)
-
 (defun eglot-jar-decompile--parse-uri (uri)
   "Parse URI into a (:jar PATH :entry ENTRY) plist, or nil when not a jar URI."
   (when (and (stringp uri) (string-prefix-p "jar:" uri))
@@ -245,6 +240,67 @@
           (puthash (expand-file-name target) 'source
                    eglot-jar-decompile--buffer-kinds)
           (cons target 'source))))))
+
+(defvar-local eglot-jar-decompile--kind nil)
+
+(defvar eglot-jar-decompile--eglot-function nil)
+
+(defun eglot-jar-decompile--cache-buffer-p ()
+  "Return non-nil when the current buffer visits a cache file."
+  (and buffer-file-name
+       (string-prefix-p
+        (file-name-as-directory
+         (expand-file-name eglot-jar-decompile-cache-directory))
+        (expand-file-name buffer-file-name))))
+
+(defun eglot-jar-decompile--cache-buffer-mode ()
+  "Make cache buffers read-only and record what they hold."
+  (when (eglot-jar-decompile--cache-buffer-p)
+    (setq buffer-read-only t)
+    (setq-local eglot-jar-decompile--kind
+                (or (gethash (expand-file-name buffer-file-name)
+                             eglot-jar-decompile--buffer-kinds)
+                    'source))))
+
+(defun eglot-jar-decompile--skip-in-cache (orig &rest args)
+  "Call ORIG with ARGS unless the current buffer is a cache buffer."
+  (unless (eglot-jar-decompile--cache-buffer-p)
+    (apply orig args)))
+
+(defun eglot-jar-decompile--eglot-uri-to-path (orig uri)
+  "Turn jar URI into a file path, delegating to ORIG otherwise."
+  (if (and (stringp uri) (string-prefix-p "jar:" uri))
+      (car (eglot-jar-decompile--materialize uri))
+    (funcall orig uri)))
+
+(defun eglot-jar-decompile--install-eglot ()
+  (require 'eglot)
+  (setq eglot-jar-decompile--eglot-function
+        (if (fboundp 'eglot-uri-to-path) 'eglot-uri-to-path 'eglot--uri-to-path))
+  (advice-add eglot-jar-decompile--eglot-function
+              :around #'eglot-jar-decompile--eglot-uri-to-path)
+  (advice-add 'eglot-ensure :around #'eglot-jar-decompile--skip-in-cache))
+
+(defun eglot-jar-decompile--uninstall-eglot ()
+  (when (and eglot-jar-decompile--eglot-function
+             (fboundp eglot-jar-decompile--eglot-function))
+    (advice-remove eglot-jar-decompile--eglot-function
+                   #'eglot-jar-decompile--eglot-uri-to-path))
+  (when (fboundp 'eglot-ensure)
+    (advice-remove 'eglot-ensure #'eglot-jar-decompile--skip-in-cache))
+  (setq eglot-jar-decompile--eglot-function nil))
+
+;;;###autoload
+(define-minor-mode eglot-jar-decompile-mode
+  "Resolve jar: URIs from Eglot and lsp-mode."
+  :global t
+  :group 'eglot-jar-decompile
+  (if eglot-jar-decompile-mode
+      (progn
+        (eglot-jar-decompile--install-eglot)
+        (add-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode))
+    (eglot-jar-decompile--uninstall-eglot)
+    (remove-hook 'find-file-hook #'eglot-jar-decompile--cache-buffer-mode)))
 
 (provide 'eglot-jar-decompile)
 ;;; eglot-jar-decompile.el ends here

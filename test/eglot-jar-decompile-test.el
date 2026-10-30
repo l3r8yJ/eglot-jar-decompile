@@ -98,5 +98,41 @@
                 (goto-char (point-min))
                 (search-forward "class a.b.C" nil t))))))
 
+(defun eglot-jar-decompile-test--eglot-path-function ()
+  (if (fboundp 'eglot-uri-to-path) 'eglot-uri-to-path 'eglot--uri-to-path))
+
+(ert-deftest eglot-jar-decompile-test-mode-toggles-advice ()
+  (let ((function (eglot-jar-decompile-test--eglot-path-function)))
+    (eglot-jar-decompile-mode 1)
+    (should (advice-member-p #'eglot-jar-decompile--eglot-uri-to-path function))
+    (eglot-jar-decompile-mode -1)
+    (should-not (advice-member-p #'eglot-jar-decompile--eglot-uri-to-path function))))
+
+(ert-deftest eglot-jar-decompile-test-eglot-advice-converts ()
+  (require 'eglot)
+  (eglot-jar-decompile-mode 1)
+  (unwind-protect
+      (let* ((eglot-jar-decompile-cache-directory (make-temp-file "ejd-cache-" t))
+             (fixture (eglot-jar-decompile-test--fixture-jar))
+             (uri (format "jar://%s!/a/b/C.java" (car fixture)))
+             (path (eglot-uri-to-path uri)))
+        (should (file-readable-p path)))
+    (eglot-jar-decompile-mode -1)))
+
+(ert-deftest eglot-jar-decompile-test-cache-buffer-read-only ()
+  (eglot-jar-decompile-mode 1)
+  (unwind-protect
+      (let* ((eglot-jar-decompile-cache-directory (make-temp-file "ejd-cache-" t))
+             (fixture (eglot-jar-decompile-test--fixture-jar))
+             (result (eglot-jar-decompile--materialize
+                      (format "jar://%s!/a/b/C.java" (car fixture))))
+             (buffer (find-file-noselect (car result))))
+        (unwind-protect
+            (with-current-buffer buffer
+              (should buffer-read-only)
+              (should (eq eglot-jar-decompile--kind 'source)))
+          (kill-buffer buffer)))
+    (eglot-jar-decompile-mode -1)))
+
 (provide 'eglot-jar-decompile-test)
 ;;; eglot-jar-decompile-test.el ends here
